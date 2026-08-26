@@ -15,70 +15,88 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install WDK via Visual Studio Installer
+      - name: Install WDK and Windows SDK
         run: |
-          # Use Visual Studio Installer to add WDK workload
+          Write-Host "=== Installing WDK and Windows SDK ==="
+          
+          # Method 1: Use VS Installer to add WDK components
           $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          
+          # Find VS installation path
+          $vsPath = & $vsWhere -latest -property installationPath
+          Write-Host "Visual Studio path: $vsPath"
           
           if (Test-Path $vsInstaller) {
-            Write-Host "Installing WDK workload via VS Installer..."
-            Start-Process -FilePath $vsInstaller -ArgumentList `
+            Write-Host "Installing WDK components via VS Installer..."
+            
+            # Install WDK workload and Windows SDK
+            $process = Start-Process -FilePath $vsInstaller -ArgumentList `
               "modify", `
-              "--installPath", "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise", `
+              "--installPath", "`"$vsPath`"", `
               "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621", `
-              "--add", "Microsoft.DriverKit.BuildTools", `
+              "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041", `
               "--quiet", "--norestart", "--wait" `
-              -Wait -NoNewWindow
-            Write-Host "WDK installation completed"
-          } else {
-            Write-Host "VS Installer not found, trying alternative method..."
+              -Wait -NoNewWindow -PassThru
+            
+            Write-Host "VS Installer exit code: $($process.ExitCode)"
           }
-
-      - name: Install WDK (Fallback)
-        if: failure()
-        run: |
-          # Download WDK with retry
-          $maxRetries = 3
-          $retryCount = 0
-          $success = $false
           
-          while (-not $success -and $retryCount -lt $maxRetries) {
-            try {
-              $retryCount++
-              Write-Host "Download attempt $retryCount of $maxRetries..."
+          # Method 2: Download and install WDK VSIX directly
+          Write-Host "`n=== Installing WDK VSIX ==="
+          
+          $wdkVsixUrl = "https://go.microsoft.com/fwlink/?linkid=2284667"
+          $wdkVsixPath = "$env:TEMP\wdk.vsix"
+          
+          try {
+            # Download WDK VSIX
+            $webClient = New-Object System.Net.WebClient
+            $webClient.DownloadFile($wdkVsixUrl, $wdkVsixPath)
+            
+            if (Test-Path $wdkVsixPath) {
+              $fileSize = (Get-Item $wdkVsixPath).Length
+              Write-Host "Downloaded WDK VSIX: $fileSize bytes"
               
-              $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2284667"
-              $wdkInstaller = "$env:TEMP\wdksetup.exe"
-              
-              # Download with WebClient (more reliable)
-              $webClient = New-Object System.Net.WebClient
-              $webClient.DownloadFile($wdkUrl, $wdkInstaller)
-              
-              # Verify file exists and has content
-              if ((Test-Path $wdkInstaller) -and (Get-Item $wdkInstaller).Length -gt 1MB) {
-                Write-Host "Download successful, installing..."
-                Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet", "/norestart" -Wait
-                $success = $true
-                Write-Host "WDK installed successfully"
-              } else {
-                throw "Downloaded file is too small or missing"
-              }
-            } catch {
-              Write-Host "Attempt $retryCount failed: $_"
-              if ($retryCount -lt $maxRetries) {
-                Start-Sleep -Seconds 5
+              # Install VSIX using VSIXInstaller
+              $vsixInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\VSIXInstaller.exe"
+              if (Test-Path $vsixInstaller) {
+                Write-Host "Installing WDK VSIX..."
+                Start-Process -FilePath $vsixInstaller -ArgumentList `
+                  "/quiet", "/admin", $wdkVsixPath `
+                  -Wait -NoNewWindow
+                Write-Host "WDK VSIX installed"
               }
             }
+          } catch {
+            Write-Host "WDK VSIX installation failed: $_"
           }
           
-          if (-not $success) {
-            Write-Host "WARNING: WDK installation failed, continuing with build..."
+          # Verify installation
+          Write-Host "`n=== Verifying Installation ==="
+          
+          $kitsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          if (Test-Path $kitsPath) {
+            Write-Host "Windows Kits include path exists: $kitsPath"
+            Get-ChildItem $kitsPath | ForEach-Object { Write-Host "  SDK Version: $($_.Name)" }
+          } else {
+            Write-Host "WARNING: Windows Kits include path not found"
+          }
+          
+          $kmPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+          if (Test-Path $kmPath) {
+            Write-Host "Kernel mode headers found: $kmPath"
+            if (Test-Path "$kmPath\ntifs.h") {
+              Write-Host "  ntifs.h: FOUND"
+            } else {
+              Write-Host "  ntifs.h: NOT FOUND"
+            }
+          } else {
+            Write-Host "WARNING: Kernel mode headers not found"
           }
 
       - name: Find MSBuild
         id: msbuild
         run: |
-          # Try multiple locations for MSBuild
           $possiblePaths = @(
             "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
             "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
@@ -95,7 +113,6 @@ jobs:
             }
           }
           
-          # Fallback to vswhere
           if (-not $msbuildPath) {
             $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
             if (Test-Path $vsWhere) {
@@ -116,13 +133,16 @@ jobs:
           $msbuildPath = "${{ steps.msbuild.outputs.msbuild_path }}"
           
           Write-Host "Building with MSBuild: $msbuildPath"
+          Write-Host "Current directory: $(Get-Location)"
+          Write-Host "Project file exists: $(Test-Path 'SPOOFER V3.vcxproj')"
           
           & $msbuildPath "SPOOFER V3.vcxproj" `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /m `
-            /v:minimal `
-            /p:WindowsDriver=true
+            /v:detailed `
+            /p:WindowsDriver=true `
+            /p:DriverTargetPlatform=amd64
           
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Build failed with exit code $LASTEXITCODE"
@@ -135,12 +155,12 @@ jobs:
         if: always()
         run: |
           Write-Host "=== Build Output Directory ==="
-          if (Test-Path "x64\Release") {
+          if (Test-Path "build\Release") {
+            Get-ChildItem "build\Release" -Recurse | ForEach-Object { Write-Host $_.FullName }
+          } elseif (Test-Path "x64\Release") {
             Get-ChildItem "x64\Release" -Recurse | ForEach-Object { Write-Host $_.FullName }
-          } elseif (Test-Path "x64") {
-            Get-ChildItem "x64" -Recurse | ForEach-Object { Write-Host $_.FullName }
           } else {
-            Write-Host "No x64 directory found"
+            Write-Host "Searching for .sys files..."
             Get-ChildItem -Recurse -Filter "*.sys" | ForEach-Object { Write-Host $_.FullName }
           }
 
@@ -150,9 +170,13 @@ jobs:
         with:
           name: driver-build
           path: |
+            build/Release/*.sys
+            build/Release/*.inf
+            build/Release/*.cat
+            build/Release/*.pdb
+            build/Release/*.hex
             x64/Release/*.sys
             x64/Release/*.inf
             x64/Release/*.cat
             x64/Release/*.pdb
-            x64/Release/*.hex
           if-no-files-found: warn
