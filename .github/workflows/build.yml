@@ -1,0 +1,178 @@
+name: Build WDK Driver
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Use windows-2022 which has WDK pre-installed
+    # windows-latest (2025) removed WDK support
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify WDK Installation
+        run: |
+          Write-Host "=== Verifying WDK Installation ==="
+          
+          # Check Windows SDK
+          $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          if (Test-Path $sdkPath) {
+            Write-Host "Windows SDK found at: $sdkPath"
+            Get-ChildItem $sdkPath | ForEach-Object { Write-Host "  Version: $($_.Name)" }
+          } else {
+            Write-Host "ERROR: Windows SDK not found!"
+            exit 1
+          }
+          
+          # Check WDK headers
+          $wdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.19041.0\km"
+          if (Test-Path $wdkPath) {
+            Write-Host "WDK kernel headers found at: $wdkPath"
+            if (Test-Path "$wdkPath\ntifs.h") {
+              Write-Host "  ntifs.h: FOUND"
+            } else {
+              Write-Host "  ntifs.h: NOT FOUND"
+              # Try other versions
+              $versions = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Where-Object { $_.Name -like "10.0.*" }
+              foreach ($ver in $versions) {
+                $testPath = "$($ver.FullName)\km\ntifs.h"
+                if (Test-Path $testPath) {
+                  Write-Host "  Found ntifs.h in version: $($ver.Name)"
+                  $wdkPath = "$($ver.FullName)\km"
+                  break
+                }
+              }
+            }
+          } else {
+            Write-Host "WARNING: WDK kernel headers not found in default location"
+            # Search for ntifs.h
+            $found = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Recurse -Filter "ntifs.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Write-Host "  Found ntifs.h at: $($found.FullName)"
+              $wdkPath = Split-Path (Split-Path $found.FullName)
+            } else {
+              Write-Host "ERROR: Could not find ntifs.h anywhere!"
+              exit 1
+            }
+          }
+          
+          echo "wdk_path=$wdkPath" >> $env:GITHUB_OUTPUT
+
+      - name: Find MSBuild
+        id: msbuild
+        run: |
+          $possiblePaths = @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe",
+            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+            "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
+          )
+          
+          $msbuildPath = $null
+          foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+              $msbuildPath = $path
+              break
+            }
+          }
+          
+          if (-not $msbuildPath) {
+            $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vsWhere) {
+              $msbuildPath = & $vsWhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+            }
+          }
+          
+          if (-not $msbuildPath) {
+            Write-Error "MSBuild not found!"
+            exit 1
+          }
+          
+          Write-Host "Found MSBuild: $msbuildPath"
+          echo "msbuild_path=$msbuildPath" >> $env:GITHUB_OUTPUT
+
+      - name: Build Driver (Release x64)
+        run: |
+          $msbuildPath = "${{ steps.msbuild.outputs.msbuild_path }}"
+          
+          Write-Host "Building with MSBuild: $msbuildPath"
+          Write-Host "Current directory: $(Get-Location)"
+          Write-Host "Project file exists: $(Test-Path 'SPOOFER V3.vcxproj')"
+          
+          # Build with verbose output for debugging
+          & $msbuildPath "SPOOFER V3.vcxproj" `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /m `
+            /v:minimal `
+            /p:WindowsDriver=true
+          
+          $exitCode = $LASTEXITCODE
+          
+          if ($exitCode -ne 0) {
+            Write-Host "`n=== Build Failed - Detailed Output ==="
+            & $msbuildPath "SPOOFER V3.vcxproj" `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /v:detailed `
+              /p:WindowsDriver=true 2>&1 | Select-Object -Last 50
+          }
+          
+          exit $exitCode
+
+      - name: List Build Output
+        if: always()
+        run: |
+          Write-Host "=== Build Output Directory ==="
+          
+          # Check multiple possible output locations
+          $outputPaths = @(
+            "build\Release",
+            "x64\Release",
+            "Release",
+            "build\x64\Release"
+          )
+          
+          $found = $false
+          foreach ($path in $outputPaths) {
+            if (Test-Path $path) {
+              Write-Host "Found output at: $path"
+              Get-ChildItem $path -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+              $found = $true
+            }
+          }
+          
+          if (-not $found) {
+            Write-Host "No output directories found. Searching for .sys files..."
+            Get-ChildItem -Recurse -Filter "*.sys" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+            Get-ChildItem -Recurse -Filter "*.pdb" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+          }
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: driver-build
+          path: |
+            build/Release/*.sys
+            build/Release/*.inf
+            build/Release/*.cat
+            build/Release/*.pdb
+            build/Release/*.hex
+            x64/Release/*.sys
+            x64/Release/*.inf
+            x64/Release/*.cat
+            x64/Release/*.pdb
+            Release/*.sys
+            Release/*.inf
+            Release/*.cat
+            Release/*.pdb
+          if-no-files-found: warn
