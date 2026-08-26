@@ -9,90 +9,61 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Use windows-2022 which has WDK pre-installed
+    # windows-latest (2025) removed WDK support
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install WDK and Windows SDK
+      - name: Verify WDK Installation
         run: |
-          Write-Host "=== Installing WDK and Windows SDK ==="
+          Write-Host "=== Verifying WDK Installation ==="
           
-          # Method 1: Use VS Installer to add WDK components
-          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          
-          # Find VS installation path
-          $vsPath = & $vsWhere -latest -property installationPath
-          Write-Host "Visual Studio path: $vsPath"
-          
-          if (Test-Path $vsInstaller) {
-            Write-Host "Installing WDK components via VS Installer..."
-            
-            # Install WDK workload and Windows SDK
-            $process = Start-Process -FilePath $vsInstaller -ArgumentList `
-              "modify", `
-              "--installPath", "`"$vsPath`"", `
-              "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621", `
-              "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041", `
-              "--quiet", "--norestart", "--wait" `
-              -Wait -NoNewWindow -PassThru
-            
-            Write-Host "VS Installer exit code: $($process.ExitCode)"
-          }
-          
-          # Method 2: Download and install WDK VSIX directly
-          Write-Host "`n=== Installing WDK VSIX ==="
-          
-          $wdkVsixUrl = "https://go.microsoft.com/fwlink/?linkid=2284667"
-          $wdkVsixPath = "$env:TEMP\wdk.vsix"
-          
-          try {
-            # Download WDK VSIX
-            $webClient = New-Object System.Net.WebClient
-            $webClient.DownloadFile($wdkVsixUrl, $wdkVsixPath)
-            
-            if (Test-Path $wdkVsixPath) {
-              $fileSize = (Get-Item $wdkVsixPath).Length
-              Write-Host "Downloaded WDK VSIX: $fileSize bytes"
-              
-              # Install VSIX using VSIXInstaller
-              $vsixInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\VSIXInstaller.exe"
-              if (Test-Path $vsixInstaller) {
-                Write-Host "Installing WDK VSIX..."
-                Start-Process -FilePath $vsixInstaller -ArgumentList `
-                  "/quiet", "/admin", $wdkVsixPath `
-                  -Wait -NoNewWindow
-                Write-Host "WDK VSIX installed"
-              }
-            }
-          } catch {
-            Write-Host "WDK VSIX installation failed: $_"
-          }
-          
-          # Verify installation
-          Write-Host "`n=== Verifying Installation ==="
-          
-          $kitsPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
-          if (Test-Path $kitsPath) {
-            Write-Host "Windows Kits include path exists: $kitsPath"
-            Get-ChildItem $kitsPath | ForEach-Object { Write-Host "  SDK Version: $($_.Name)" }
+          # Check Windows SDK
+          $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          if (Test-Path $sdkPath) {
+            Write-Host "Windows SDK found at: $sdkPath"
+            Get-ChildItem $sdkPath | ForEach-Object { Write-Host "  Version: $($_.Name)" }
           } else {
-            Write-Host "WARNING: Windows Kits include path not found"
+            Write-Host "ERROR: Windows SDK not found!"
+            exit 1
           }
           
-          $kmPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-          if (Test-Path $kmPath) {
-            Write-Host "Kernel mode headers found: $kmPath"
-            if (Test-Path "$kmPath\ntifs.h") {
+          # Check WDK headers
+          $wdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.19041.0\km"
+          if (Test-Path $wdkPath) {
+            Write-Host "WDK kernel headers found at: $wdkPath"
+            if (Test-Path "$wdkPath\ntifs.h") {
               Write-Host "  ntifs.h: FOUND"
             } else {
               Write-Host "  ntifs.h: NOT FOUND"
+              # Try other versions
+              $versions = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Where-Object { $_.Name -like "10.0.*" }
+              foreach ($ver in $versions) {
+                $testPath = "$($ver.FullName)\km\ntifs.h"
+                if (Test-Path $testPath) {
+                  Write-Host "  Found ntifs.h in version: $($ver.Name)"
+                  $wdkPath = "$($ver.FullName)\km"
+                  break
+                }
+              }
             }
           } else {
-            Write-Host "WARNING: Kernel mode headers not found"
+            Write-Host "WARNING: WDK kernel headers not found in default location"
+            # Search for ntifs.h
+            $found = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Recurse -Filter "ntifs.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Write-Host "  Found ntifs.h at: $($found.FullName)"
+              $wdkPath = Split-Path (Split-Path $found.FullName)
+            } else {
+              Write-Host "ERROR: Could not find ntifs.h anywhere!"
+              exit 1
+            }
           }
+          
+          echo "wdk_path=$wdkPath" >> $env:GITHUB_OUTPUT
 
       - name: Find MSBuild
         id: msbuild
@@ -136,32 +107,53 @@ jobs:
           Write-Host "Current directory: $(Get-Location)"
           Write-Host "Project file exists: $(Test-Path 'SPOOFER V3.vcxproj')"
           
+          # Build with verbose output for debugging
           & $msbuildPath "SPOOFER V3.vcxproj" `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /m `
-            /v:detailed `
-            /p:WindowsDriver=true `
-            /p:DriverTargetPlatform=amd64
+            /v:minimal `
+            /p:WindowsDriver=true
           
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
+          $exitCode = $LASTEXITCODE
+          
+          if ($exitCode -ne 0) {
+            Write-Host "`n=== Build Failed - Detailed Output ==="
+            & $msbuildPath "SPOOFER V3.vcxproj" `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /v:detailed `
+              /p:WindowsDriver=true 2>&1 | Select-Object -Last 50
           }
           
-          Write-Host "Build completed successfully!"
+          exit $exitCode
 
       - name: List Build Output
         if: always()
         run: |
           Write-Host "=== Build Output Directory ==="
-          if (Test-Path "build\Release") {
-            Get-ChildItem "build\Release" -Recurse | ForEach-Object { Write-Host $_.FullName }
-          } elseif (Test-Path "x64\Release") {
-            Get-ChildItem "x64\Release" -Recurse | ForEach-Object { Write-Host $_.FullName }
-          } else {
-            Write-Host "Searching for .sys files..."
-            Get-ChildItem -Recurse -Filter "*.sys" | ForEach-Object { Write-Host $_.FullName }
+          
+          # Check multiple possible output locations
+          $outputPaths = @(
+            "build\Release",
+            "x64\Release",
+            "Release",
+            "build\x64\Release"
+          )
+          
+          $found = $false
+          foreach ($path in $outputPaths) {
+            if (Test-Path $path) {
+              Write-Host "Found output at: $path"
+              Get-ChildItem $path -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+              $found = $true
+            }
+          }
+          
+          if (-not $found) {
+            Write-Host "No output directories found. Searching for .sys files..."
+            Get-ChildItem -Recurse -Filter "*.sys" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+            Get-ChildItem -Recurse -Filter "*.pdb" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
           }
 
       - name: Upload Build Artifacts
@@ -179,4 +171,8 @@ jobs:
             x64/Release/*.inf
             x64/Release/*.cat
             x64/Release/*.pdb
+            Release/*.sys
+            Release/*.inf
+            Release/*.cat
+            Release/*.pdb
           if-no-files-found: warn
