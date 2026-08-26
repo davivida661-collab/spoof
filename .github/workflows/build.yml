@@ -1,0 +1,57 @@
+name: Build WDK Driver
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install WDK
+        run: |
+          # Download WDK installer
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2284667"
+          $wdkInstaller = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+          
+          # Install WDK silently
+          Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet", "/norestart" -Wait
+          
+          echo "WDK installed successfully"
+
+      - name: Build Driver (Release x64)
+        run: |
+          # Find MSBuild
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuildPath = & $vsWhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          
+          if (-not $msbuildPath) {
+            echo "MSBuild not found, trying default path"
+            $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
+          }
+          
+          echo "Using MSBuild: $msbuildPath"
+          
+          # Build the project
+          & $msbuildPath "SPOOFER V3.vcxproj" /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+          
+          echo "Build completed!"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-build
+          path: |
+            x64/Release/*.sys
+            x64/Release/*.inf
+            x64/Release/*.cat
+            x64/Release/*.pdb
+          if-no-files-found: warn
